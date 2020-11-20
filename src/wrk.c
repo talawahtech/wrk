@@ -36,6 +36,7 @@ static struct http_parser_settings parser_settings = {
 };
 
 static volatile sig_atomic_t stop = 0;
+static volatile sig_atomic_t collect_stats = 0;
 
 static void handler(int sig) {
     stop = 1;
@@ -138,13 +139,18 @@ int main(int argc, char **argv) {
     printf("Running %s test @ %s\n", time, url);
     printf("  %"PRIu64" threads and %"PRIu64" connections\n", cfg.threads, cfg.connections);
 
-    uint64_t start    = time_us();
     uint64_t complete = 0;
     uint64_t bytes    = 0;
     errors errors     = { 0 };
 
+    uint64_t start    = time_us();
+    collect_stats = 1;
+
     sleep(cfg.duration);
     stop = 1;
+
+    collect_stats = 0;
+    uint64_t runtime_us = time_us() - start;
 
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t = &threads[i];
@@ -160,7 +166,6 @@ int main(int argc, char **argv) {
         errors.status  += t->errors.status;
     }
 
-    uint64_t runtime_us = time_us() - start;
     long double runtime_s   = runtime_us / 1000000.0;
     long double req_per_s   = complete   / runtime_s;
     long double bytes_per_s = bytes      / runtime_s;
@@ -224,7 +229,7 @@ void *thread_main(void *arg) {
     aeEventLoop *loop = thread->loop;
     aeCreateTimeEvent(loop, RECORD_INTERVAL_MS, record_rate, thread, NULL);
 
-    thread->start = time_us();
+    thread->start = 0;
     aeMain(loop);
 
     aeDeleteEventLoop(loop);
@@ -273,14 +278,20 @@ static int reconnect_socket(thread *thread, connection *c) {
 static int record_rate(aeEventLoop *loop, long long id, void *data) {
     thread *thread = data;
 
-    if (thread->requests > 0) {
-        uint64_t elapsed_ms = (time_us() - thread->start) / 1000;
-        uint64_t requests = (thread->requests / (double) elapsed_ms) * 1000;
+    if (collect_stats && thread->requests > 0) {
+        if (thread->start == 0) {
+            thread->requests = 0;
+            thread->start    = time_us();
+        }
+        else {
+            uint64_t elapsed_ms = (time_us() - thread->start) / 1000;
+            uint64_t requests = (thread->requests / (double) elapsed_ms) * 1000;
 
-        stats_record(statistics.requests, requests);
+            stats_record(statistics.requests, requests);
 
-        thread->requests = 0;
-        thread->start    = time_us();
+            thread->requests = 0;
+            thread->start    = time_us();
+        }
     }
 
     if (stop) aeStop(loop);
@@ -327,11 +338,13 @@ static int response_complete(http_parser *parser) {
     uint64_t now = time_us();
     int status = parser->status_code;
 
-    thread->complete++;
-    thread->requests++;
+    if (collect_stats){
+        thread->complete++;
+        thread->requests++;
 
-    if (status > 399) {
-        thread->errors.status++;
+        if (status > 399) {
+            thread->errors.status++;
+        }
     }
 
     if (c->headers.buffer) {
@@ -341,7 +354,7 @@ static int response_complete(http_parser *parser) {
     }
 
     if (--c->pending == 0) {
-        if (!stats_record(statistics.latency, now - c->start)) {
+        if (collect_stats && !stats_record(statistics.latency, now - c->start)) {
             thread->errors.timeout++;
         }
         c->delayed = cfg.delay;
@@ -437,7 +450,7 @@ static void socket_readable(aeEventLoop *loop, int fd, void *data, int mask) {
         if (http_parser_execute(&c->parser, &parser_settings, c->buf, n) != n) goto error;
         if (n == 0 && !http_body_is_final(&c->parser)) goto error;
 
-        c->thread->bytes += n;
+        if (collect_stats) c->thread->bytes += n;
     } while (n == RECVBUF && sock.readable(c) > 0);
 
     return;
