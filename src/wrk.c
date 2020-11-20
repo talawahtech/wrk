@@ -1,4 +1,5 @@
 // Copyright (C) 2012 - Will Glozer.  All rights reserved.
+#define _GNU_SOURCE
 
 #include "wrk.h"
 #include "script.h"
@@ -14,6 +15,7 @@ static struct config {
     bool     delay;
     bool     dynamic;
     bool     latency;
+    bool     pin_cpus;
     char    *host;
     char    *script;
     SSL_CTX *ctx;
@@ -53,6 +55,7 @@ static void usage() {
            "    -s, --script      <S>  Load Lua script file       \n"
            "    -H, --header      <H>  Add header to request      \n"
            "        --latency          Print latency statistics   \n"
+           "        --pin-cpus         Pin threads to online cpus \n"
            "    -D  --delay-stats <T>  Stats collection delay     \n"
            "        --timeout     <T>  Socket/request timeout     \n"
            "    -v, --version          Print version details      \n"
@@ -104,6 +107,29 @@ int main(int argc, char **argv) {
 
     cfg.host = host;
 
+    pthread_attr_t pthread_attr;
+    cpu_set_t online_cpus, cpu;
+
+    CPU_ZERO(&online_cpus);
+    sched_getaffinity(0, sizeof(online_cpus), &online_cpus); // Get set of all online CPUs
+
+    int num_online_cpus = CPU_COUNT(&online_cpus); // Get count of online CPUs
+    int rel_to_abs_cpu[num_online_cpus];
+    int rel_cpu_index = 0;
+
+    // Create a mapping between the relative cpu id and absolute cpu id for cases where the cpu ids are not contiguous
+    // E.g if only cpus 0, 1, 8, and 9 are visible to the app because taskset was used or because some cpus are offline
+    // then the mapping is 0 -> 0, 1 -> 1, 2 -> 8, 3 -> 9
+    for (int abs_cpu_index = 0; abs_cpu_index < CPU_SETSIZE; abs_cpu_index++) {
+        if (CPU_ISSET(abs_cpu_index, &online_cpus)){
+            rel_to_abs_cpu[rel_cpu_index] = abs_cpu_index;
+            rel_cpu_index++;
+
+            if (rel_cpu_index == num_online_cpus)
+                break;
+        }
+    }
+
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t      = &threads[i];
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
@@ -123,11 +149,21 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (!t->loop || pthread_create(&t->thread, NULL, &thread_main, t)) {
+        pthread_attr_init(&pthread_attr);
+
+        if (cfg.pin_cpus){
+            CPU_ZERO(&cpu);
+            CPU_SET(rel_to_abs_cpu[i % num_online_cpus], &cpu);
+            pthread_attr_setaffinity_np(&pthread_attr, sizeof(cpu), &cpu);
+        }
+
+        if (!t->loop || pthread_create(&t->thread, &pthread_attr, &thread_main, t)) {
             char *msg = strerror(errno);
             fprintf(stderr, "unable to create thread %"PRIu64": %s\n", i, msg);
             exit(2);
         }
+
+        pthread_attr_destroy(&pthread_attr);
     }
 
     struct sigaction sa = {
@@ -493,6 +529,7 @@ static struct option longopts[] = {
     { "script",      required_argument, NULL, 's' },
     { "header",      required_argument, NULL, 'H' },
     { "latency",     no_argument,       NULL, 'L' },
+    { "pin-cpus",    no_argument,       NULL, 'P' },
     { "delay-stats", required_argument, NULL, 'D' },
     { "timeout",     required_argument, NULL, 'T' },
     { "help",        no_argument,       NULL, 'h' },
@@ -511,7 +548,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->delay_stats = 0;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:D:Lrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:D:LPrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -530,6 +567,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 break;
             case 'H':
                 *header++ = optarg;
+                break;
+            case 'P':
+                cfg->pin_cpus = true;
                 break;
             case 'L':
                 cfg->latency = true;
