@@ -10,6 +10,7 @@ static struct config {
     uint64_t threads;
     uint64_t timeout;
     uint64_t pipeline;
+    uint64_t delay_stats;
     bool     delay;
     bool     dynamic;
     bool     latency;
@@ -52,6 +53,7 @@ static void usage() {
            "    -s, --script      <S>  Load Lua script file       \n"
            "    -H, --header      <H>  Add header to request      \n"
            "        --latency          Print latency statistics   \n"
+           "    -D  --delay-stats <T>  Stats collection delay     \n"
            "        --timeout     <T>  Socket/request timeout     \n"
            "    -v, --version          Print version details      \n"
            "                                                      \n"
@@ -134,6 +136,11 @@ int main(int argc, char **argv) {
     };
     sigfillset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
+
+    // Sleep to allow time for connections to be established and threads to ramp up before collecting stats
+    if (cfg.delay_stats){
+        sleep(cfg.delay_stats);
+    }
 
     char *time = format_time_s(cfg.duration);
     printf("Running %s test @ %s\n", time, url);
@@ -486,6 +493,7 @@ static struct option longopts[] = {
     { "script",      required_argument, NULL, 's' },
     { "header",      required_argument, NULL, 'H' },
     { "latency",     no_argument,       NULL, 'L' },
+    { "delay-stats", required_argument, NULL, 'D' },
     { "timeout",     required_argument, NULL, 'T' },
     { "help",        no_argument,       NULL, 'h' },
     { "version",     no_argument,       NULL, 'v' },
@@ -500,9 +508,10 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->threads     = 2;
     cfg->connections = 10;
     cfg->duration    = 10;
+    cfg->delay_stats = 0;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:D:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -512,6 +521,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 break;
             case 'd':
                 if (scan_time(optarg, &cfg->duration)) return -1;
+                break;
+            case 'D':
+                if (scan_time(optarg, &cfg->delay_stats)) return -1;
                 break;
             case 's':
                 cfg->script = optarg;
